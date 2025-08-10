@@ -114,7 +114,7 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 		// Add headers, permission authentication + masquerade sources
 		err = wp.beforeHandshake(req)
 		if err != nil {
-			http.Error(writer, err.Error(), http.StatusBadRequest)
+			_, _ = writer.Write([]byte(err.Error()))
 			return
 		}
 	}
@@ -126,7 +126,7 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 		remoteConnRW, err = tls.Dial("tcp", wp.remoteAddr, wp.tlsc)
 	}
 	if err != nil {
-		http.Error(writer, err.Error(), http.StatusInternalServerError)
+		_, _ = writer.Write([]byte(err.Error()))
 		return
 	}
 	defer remoteConnRW.Close()
