@@ -8,7 +8,7 @@ import (
 
 func TestNewWebsocketProxy(t *testing.T) {
 	tlsc := tls.Config{InsecureSkipVerify: true}
-	wp, err := NewProxy("ws://www.baidu.com:80/ajaxchattest", auth, SetTLSConfig(&tlsc))
+	wp, err := NewProxy("ws://www.baidu.com:80/ajaxchattest", SetBeforeCallback(auth), SetTLSConfig(&tlsc))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +18,7 @@ func TestNewWebsocketProxy(t *testing.T) {
 
 func TestNewHandler(t *testing.T) {
 	tlsc := tls.Config{InsecureSkipVerify: true}
-	wp, err := NewProxy("ws://www.baidu.com:80/ajaxchattest", auth, SetTLSConfig(&tlsc))
+	wp, err := NewProxy("ws://www.baidu.com:80/ajaxchattest", SetBeforeCallback(auth), SetTLSConfig(&tlsc))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -57,7 +57,7 @@ type Options func(wp *WebsocketProxy)
 
 // You must carry a port number，ws://ip:80/ssss, wss://ip:443/aaaa
 // ex: ws://ip:port/ajaxchattest
-func NewProxy(addr string, beforeCallback func(r *http.Request) error, options ...Options) (*WebsocketProxy, error) {
+func NewProxy(addr string, options ...Options) (*WebsocketProxy, error) {
 	u, err := url.Parse(addr)
 	if err != nil {
 		return nil, ErrFormatAddr
@@ -70,11 +70,10 @@ func NewProxy(addr string, beforeCallback func(r *http.Request) error, options .
 		return nil, ErrFormatAddr
 	}
 	wp := &WebsocketProxy{
-		scheme:          u.Scheme,
-		remoteAddr:      fmt.Sprintf("%s:%s", host, port),
-		defaultPath:     u.Path,
-		beforeHandshake: beforeCallback,
-		logger:          log.New(os.Stderr, "", log.LstdFlags),
+		scheme:      u.Scheme,
+		remoteAddr:  fmt.Sprintf("%s:%s", host, port),
+		defaultPath: u.Path,
+		logger:      log.New(os.Stderr, "", log.LstdFlags),
 	}
 	if u.Scheme == WssScheme {
 		wp.tlsc = &tls.Config{InsecureSkipVerify: true}
@@ -92,18 +91,22 @@ func (wp *WebsocketProxy) ServeHTTP(writer http.ResponseWriter, request *http.Re
 func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Request) {
 	if strings.ToLower(request.Header.Get("Connection")) != "upgrade" ||
 		strings.ToLower(request.Header.Get("Upgrade")) != "websocket" {
-		_, _ = writer.Write([]byte(`Must be a websocket request`))
+		http.Error(writer, "must be a websocket request", http.StatusExpectationFailed)
 		return
 	}
 	hijacker, ok := writer.(http.Hijacker)
 	if !ok {
 		return
 	}
-	conn, _, err := hijacker.Hijack()
+
+	connRW, _, err := hijacker.Hijack()
 	if err != nil {
 		return
 	}
-	defer conn.Close()
+	defer connRW.Close()
+
+	connR := io.TeeReader(connRW, wp.logger.Writer())
+
 	req := request.Clone(request.Context())
 	req.URL.Path, req.URL.RawPath, req.RequestURI = wp.defaultPath, wp.defaultPath, wp.defaultPath
 	req.Host = wp.remoteAddr
@@ -111,41 +114,43 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 		// Add headers, permission authentication + masquerade sources
 		err = wp.beforeHandshake(req)
 		if err != nil {
-			_, _ = writer.Write([]byte(err.Error()))
+			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
-	var remoteConn net.Conn
+	var remoteConnRW net.Conn
 	switch wp.scheme {
 	case WsScheme:
-		remoteConn, err = net.Dial("tcp", wp.remoteAddr)
+		remoteConnRW, err = net.Dial("tcp", wp.remoteAddr)
 	case WssScheme:
-		remoteConn, err = tls.Dial("tcp", wp.remoteAddr, wp.tlsc)
+		remoteConnRW, err = tls.Dial("tcp", wp.remoteAddr, wp.tlsc)
 	}
 	if err != nil {
-		_, _ = writer.Write([]byte(err.Error()))
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer remoteConn.Close()
-	err = req.Write(remoteConn)
+	defer remoteConnRW.Close()
+	err = req.Write(remoteConnRW)
 	if err != nil {
 		wp.logger.Println("remote write err:", err)
 		return
 	}
+
+	remoteConnR := io.TeeReader(remoteConnRW, wp.logger.Writer())
+
 	errChan := make(chan error, 2)
-	copyConn := func(a, b net.Conn) {
+	copyConn := func(a io.Writer, b io.Reader) {
 		buf := ByteSliceGet(BufSize)
 		defer ByteSlicePut(buf)
 		_, err := io.CopyBuffer(a, b, buf)
 		errChan <- err
 	}
-	go copyConn(conn, remoteConn) // response
-	go copyConn(remoteConn, conn) // request
-	select {
-	case err = <-errChan:
-		if err != nil {
-			log.Println(err)
-		}
+	go copyConn(connRW, remoteConnR) // response
+	go copyConn(remoteConnRW, connR) // request
+
+	err = <-errChan
+	if err != nil {
+		wp.logger.Println(err)
 	}
 }
 
@@ -160,5 +165,11 @@ func SetLogger(l *log.Logger) Options {
 		if l != nil {
 			wp.logger = l
 		}
+	}
+}
+
+func SetBeforeCallback(cb func(r *http.Request) error) Options {
+	return func(wp *WebsocketProxy) {
+		wp.beforeHandshake = cb
 	}
 }
