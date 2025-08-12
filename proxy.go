@@ -24,11 +24,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 )
 
@@ -48,7 +47,7 @@ type WebsocketProxy struct {
 	// path
 	defaultPath string
 	tlsc        *tls.Config
-	logger      *log.Logger
+	logger      SlogWriter
 	// Send handshake before callback
 	beforeHandshake func(r *http.Request) error
 }
@@ -73,7 +72,7 @@ func NewProxy(addr string, options ...Options) (*WebsocketProxy, error) {
 		scheme:      u.Scheme,
 		remoteAddr:  fmt.Sprintf("%s:%s", host, port),
 		defaultPath: u.Path,
-		logger:      log.New(os.Stderr, "", log.LstdFlags),
+		logger:      NullLogger{},
 	}
 	if u.Scheme == WssScheme {
 		wp.tlsc = &tls.Config{InsecureSkipVerify: true}
@@ -91,21 +90,29 @@ func (wp *WebsocketProxy) ServeHTTP(writer http.ResponseWriter, request *http.Re
 func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Request) {
 	if strings.ToLower(request.Header.Get("Connection")) != "upgrade" ||
 		strings.ToLower(request.Header.Get("Upgrade")) != "websocket" {
-		http.Error(writer, "must be a websocket request", http.StatusExpectationFailed)
+		msg := "must be a websocket request"
+		slog.Error(msg)
+		http.Error(writer, msg, http.StatusExpectationFailed)
 		return
 	}
 	hijacker, ok := writer.(http.Hijacker)
 	if !ok {
+		msg := "request does not satisfy the http.Hijacker interface"
+		slog.Error(msg)
+		http.Error(writer, msg, http.StatusBadRequest)
 		return
 	}
 
 	connRW, _, err := hijacker.Hijack()
 	if err != nil {
+		msg := fmt.Errorf("could not hijack the request. %w", err)
+		slog.Error(msg.Error())
+		fmt.Fprint(writer, msg.Error())
 		return
 	}
 	defer connRW.Close()
 
-	connR := io.TeeReader(connRW, wp.logger.Writer())
+	connR := io.TeeReader(connRW, wp.logger.Direction("response"))
 
 	req := request.Clone(request.Context())
 	req.URL.Path, req.URL.RawPath, req.RequestURI = wp.defaultPath, wp.defaultPath, wp.defaultPath
@@ -114,7 +121,9 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 		// Add headers, permission authentication + masquerade sources
 		err = wp.beforeHandshake(req)
 		if err != nil {
-			_, _ = writer.Write([]byte(err.Error()))
+			msg := fmt.Errorf("error returned by callback: %w", err)
+			slog.Error(msg.Error())
+			fmt.Fprint(writer, msg.Error())
 			return
 		}
 	}
@@ -126,17 +135,21 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 		remoteConnRW, err = tls.Dial("tcp", wp.remoteAddr, wp.tlsc)
 	}
 	if err != nil {
-		_, _ = writer.Write([]byte(err.Error()))
+		msg := fmt.Errorf("problem dialing remote: %w", err.Error())
+		slog.Error(msg.Error())
+		fmt.Fprint(writer, msg.Error())
 		return
 	}
 	defer remoteConnRW.Close()
 	err = req.Write(remoteConnRW)
 	if err != nil {
-		wp.logger.Println("remote write err:", err)
+		msg := fmt.Errorf("remote write err: %w", err)
+		slog.Error(msg.Error())
+		fmt.Fprint(writer, msg.Error())
 		return
 	}
 
-	remoteConnR := io.TeeReader(remoteConnRW, wp.logger.Writer())
+	remoteConnR := io.TeeReader(remoteConnRW, wp.logger.Direction("request"))
 
 	errChan := make(chan error, 2)
 	copyConn := func(a io.Writer, b io.Reader) {
@@ -150,7 +163,8 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 
 	err = <-errChan
 	if err != nil {
-		wp.logger.Println(err)
+		slog.Error(err.Error())
+		fmt.Fprint(writer, err.Error())
 	}
 }
 
@@ -160,7 +174,7 @@ func SetTLSConfig(tlsc *tls.Config) Options {
 	}
 }
 
-func SetLogger(l *log.Logger) Options {
+func SetLogger(l SlogWriter) Options {
 	return func(wp *WebsocketProxy) {
 		if l != nil {
 			wp.logger = l
@@ -172,4 +186,27 @@ func SetBeforeCallback(cb func(r *http.Request) error) Options {
 	return func(wp *WebsocketProxy) {
 		wp.beforeHandshake = cb
 	}
+}
+
+type SlogWriter interface {
+	Direction(string) io.Writer
+}
+
+type NullLogger struct{}
+
+func (m NullLogger) Direction(_ string) io.Writer {
+	return io.Discard
+}
+
+type FullLogger struct {
+	*slog.Logger
+}
+
+func (m FullLogger) Direction(name string) io.Writer {
+	return &FullLogger{slog.With(name)}
+}
+
+func (m *FullLogger) Write(v []byte) (int, error) {
+	m.Logger.Debug(string(v))
+	return len(v), nil
 }
